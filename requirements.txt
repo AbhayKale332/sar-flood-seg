@@ -1,0 +1,35 @@
+# ── Team ENDRA · DeepSARFlood ─────────────────────────────────────────────
+# Python 3.10+  ·  CUDA GPU strongly recommended
+# On Kaggle the notebook installs these into /kaggle/temp/custom_libs
+
+# ── Core deep learning ───────────────────────────────────────────────────
+torch
+lightning                 # PyTorch Lightning training loop
+terratorch                # IBM EO fine-tuning framework (Prithvi backbones)
+
+# ── Geospatial I/O & processing ──────────────────────────────────────────
+rasterio                  # GeoTIFF read/write, reprojection, merging
+rioxarray                 # xarray-backed raster handling
+pyproj                    # CRS transforms
+whitebox                  # terrain analysis (DEM derivatives, mid-submission nb)
+
+# ── Elevation & data retrieval ───────────────────────────────────────────
+earthaccess               # NASA Earthdata client — NASADEM tiles (main pipeline)
+pystac-client             # STAC catalogue queries (mid-submission pipeline)
+planetary-computer        # Microsoft PC signing (Copernicus DEM, Sentinel-1)
+kaggle                    # competition dataset download
+
+# ── Augmentation & imaging ───────────────────────────────────────────────
+albumentations            # geometric augmentation
+opencv-python-headless    # DEM resampling & morphological post-processing
+
+# ── Scientific stack ─────────────────────────────────────────────────────
+numpy
+pandas
+
+# ── Monitoring ───────────────────────────────────────────────────────────
+tensorboard
+
+# ── Presentation generation (presentation/generate_ppt.py) ───────────────
+python-pptx
+lxml

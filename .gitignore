@@ -1,0 +1,26 @@
+# ── Data & model artefacts (never commit) ────────────────────────────────
+data/
+Output/
+prediction/
+*.ckpt
+*.tif
+*.zip
+submission*.csv
+master_dem.tif
+master_dry_reference.tif
+stats.json
+tunnel_url.txt
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ── Office temp files ────────────────────────────────────────────────────
+~$*.docx
+~$*.pptx
+
+# ── OS ───────────────────────────────────────────────────────────────────
+.DS_Store

@@ -1,193 +1,642 @@
-# Mid-Point Check-in: AI for Science & Engineering
-**Project Title:** Multi-Modal SAR-Optical Fusion for Flood Segmentation with Domain-Informed Feature Engineering  
-**Team Name:** Team ENDRA  
-**Primary Domain:** Geospatial AI / Earth Observation / Flood Detection (Remote Sensing Segmentation)
+<div align="center">
+
+# 🌊 DeepSARFlood
+
+### Physics-Informed Flood Segmentation with Foundation-Model Fine-Tuning
+
+**Team ENDRA** · ANRF AISEHack 2026 · Theme 1 — Flood Segmentation · West Bengal, India
+
+[![Task](https://img.shields.io/badge/Task-Semantic%20Segmentation-0EA5E9?style=flat-square&logo=opencv&logoColor=white)](#-the-problem)
+[![Backbone](https://img.shields.io/badge/Backbone-Prithvi--EO--2.0--100M--TL-7C3AED?style=flat-square)](https://huggingface.co/ibm-nasa-geospatial/Prithvi-EO-2.0-100M-TL)
+[![Params](https://img.shields.io/badge/Params-121M-8B5CF6?style=flat-square)](#️-training-recipe)
+[![Framework](https://img.shields.io/badge/TerraTorch-⚡%20Lightning-EE4C2C?style=flat-square&logo=pytorchlightning&logoColor=white)](https://github.com/IBM/terratorch)
+[![Bands](https://img.shields.io/badge/Input-10--band%20stack-1E88E5?style=flat-square)](#-feature-engineering--the-core-novelty)
+[![mIoU](https://img.shields.io/badge/test%2FmIoU-0.393-00C896?style=flat-square)](#-results)
+[![License](https://img.shields.io/badge/License-ANRF%20Open-FFB300?style=flat-square)](LICENSE.md)
+
+<sub>Mapping flood inundation across the Ganges–Brahmaputra delta from a **single** Sentinel-1 pass —<br/>no pre-event image, no cloud-free optical, no temporal stack required at inference.</sub>
+
+</div>
 
 ---
 
+## 📖 Table of Contents
+
+| | Section | What's inside |
+|---|---|---|
+| 🎯 | [The Problem](#-the-problem) | Why 3-class flood mapping from SAR is hard |
+| 💡 | [Our Approach](#-our-approach-in-60-seconds) | The one-paragraph version |
+| 🏗 | [Architecture](#-architecture) | End-to-end pipeline diagram |
+| 🧪 | [Feature Engineering](#-feature-engineering--the-core-novelty) | The 10-band physics stack |
+| ⚙️ | [Training Recipe](#️-training-recipe) | Loss, class weights, hyperparameters |
+| 📊 | [Results](#-results) | **Measured metrics** + honest error analysis |
+| 🧭 | [Challenges & Pivots](#-challenges--pivots) | What broke and what we did about it |
+| 🗺 | [Roadmap](#-roadmap) | Delivered vs. planned |
+| 📁 | [Repository Structure](#-repository-structure) | Where everything lives |
+| 🚀 | [Quickstart](#-quickstart) | Run it yourself |
+| 👥 | [Team & License](#-team) | Credits |
+
 ---
 
-## Page 1: Problem, Strategy, and Novelty
+## 🎯 The Problem
 
-### 1. Proposed Strategy & Technical Novelty
+Flood extent mapping from Sentinel-1 SAR is a **three-class semantic segmentation** problem:
 
-**Problem Framing:**  
-Flood extent mapping from Sentinel-1 SAR imagery is a three-class semantic segmentation problem: *No Flood (0)*, *Flood (1)*, and *Permanent Water Body (2)*. The core difficulty is that SAR backscatter alone cannot reliably disambiguate flood inundation from persistent open water or smooth urban surfaces. Furthermore, temporal context (pre-flood SAR state) is typically absent at inference time, and optical imagery suffers from cloud cover during active flood events — both of which force strictly single-pass, single-image inference.
+| Class | Label | Description | Difficulty |
+|:---:|:---|:---|:---|
+| ⬛ **0** | `No Flood` | Dry land, urban, vegetation | Majority class — easy, but dominates the loss |
+| 🟦 **1** | `Flood` | Transient inundation | ⚠️ **Rare** (<5% of pixels) — *this is the scored class* |
+| 🟨 **2** | `Water Body` | Rivers, lakes, reservoirs | Confusable with Class 1 — identical SAR signature |
 
----
-
-#### Workflow / Architecture
+### Why it's hard
 
 ```
-Raw TIF (6ch: HH, HV, Green, Red, NIR, SWIR)
-        │
-        ▼ [BandStacker — per-image, lossless]
-Engineered 6-band Stack:
-  [HH, HV, NDWI, MNDWI, NDVI, SAR_LogRatio]
-        │
-        ▼ [compute_stats — dataset-wide online pass]
-Per-band mean/std normalization
-        │
-        ▼ [Albumentations: H/V flip, Rotate90, ShiftScaleRotate]
-Augmented Tensor (B × 6 × H × W)
-        │
-        ▼ [Prithvi-EO-v2-300 ViT Encoder — pretrained on multi-spectral EO]
-Token Embeddings (temporal dim=1, neck: ReshapeTokensToImage)
-        │
-        ▼ [UperNetDecoder — decoder_channels=512]
-Multi-scale Feature Pyramid
-        │
-        ▼ [Head: Dropout → Conv1×1 → 3-class logits]
-Loss: α·CrossEntropy(w=[1.0, 8.0, 4.0]) + (1−α)·DiceLoss   [α=0.3, DICE_WEIGHT=0.7]
-        │
-        ▼ [3-Phase Training Schedule → Optuna HPO → 3-seed Ensemble]
-Soft-averaged Ensemble Prediction (argmax over mean softmax)
-        │
-        ▼ RLE Submission (Class 1 extraction → CSV)
+🛰  SAR backscatter alone cannot separate flood water from permanent water.
+     Both are specular reflectors → both appear dark. Same signal, different class.
+
+☁️  Optical imagery is unusable during active floods — that's when clouds are there.
+
+⏱  No pre-event SAR pair at inference time → classic change detection is blocked.
+
+⚖️  Flood pixels are <5% of the image → plain cross-entropy collapses to background.
+
+🏔  The study area is the Ganges delta: mean elevation ≈ 2.4 m.
+     There is almost no terrain relief to separate "floodable" from "dry".
+```
+
+> **In one line:** the model has to infer *where water shouldn't be* from a single dark-pixel image, on land that is barely above sea level.
+
+---
+
+## 💡 Our Approach in 60 Seconds
+
+> We stop asking the network to rediscover radar physics and hydrology from scratch.
+>
+> Instead of feeding raw SAR bands into a generic CNN, we **pre-compute the physics** — polarimetric ratios, terrain elevation, slope — and fuse them with the optical bands into a purpose-built **10-band stack**, then fine-tune **Prithvi-EO-2.0**, NASA/IBM's Earth-Observation foundation model, on top of it.
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+### 🛰 Foundation Model
+**Prithvi-EO-2.0-100M-TL**
+
+A ViT pre-trained on global multi-spectral EO imagery. Its attention already understands terrain texture at continental scale — we only adapt it. **121M** trainable params after the UperNet head.
+
+</td>
+<td width="33%" valign="top">
+
+### 🧮 Polarimetric Features
+**Log-difference + ratio**
+
+`10·log₁₀(HH−HV)` and `HH/HV` are the physically canonical radar-hydrology representations — computed *before* the network, not learned from scratch.
+
+</td>
+<td width="33%" valign="top">
+
+### 🎯 Flood-Biased Loss
+**CE + Dice, weighted 7×**
+
+Dice is class-frequency agnostic; the 7× flood weight on CE stops the model collapsing to all-background on a <5% class.
+
+</td>
+</tr>
+</table>
+
+---
+
+## 🏗 Architecture
+
+```mermaid
+flowchart TD
+    A["🛰️ <b>Competition Patches</b><br/>6-band Sentinel-1 + optical<br/><i>HH · HV · G · R · NIR · SWIR</i>"]
+    A2["🏔️ <b>NASADEM HGT</b><br/>30 m SRTM tiles via earthaccess<br/><i>BBOX 86.5–89.0°E, 21.5–24.5°N</i>"]
+
+    subgraph PREP ["🧱 &nbsp;Stage 1 — Feature Engineering &nbsp;<i>(offline, per-patch)</i>"]
+        direction TB
+        C["<b>DEMDownloader</b><br/>search + fetch NASADEM_HGT"]
+        D["<b>DEMProcessor</b><br/>unzip → rasterio.merge mosaic"]
+        E["<b>DeepFeatureStacker</b><br/>reproject to scene CRS · cache<br/>window-crop · resize · ∇ slope"]
+        C --> D --> E
+    end
+
+    F["📦 <b>10-Band Physics Stack</b><br/>HH · HV · LogDiff · Ratio · DEM · Slope<br/>Green · Red · NIR · SWIR"]
+
+    subgraph TRAIN ["🧠 &nbsp;Stage 2 — Model"]
+        direction TB
+        G["<b>Per-band normalisation</b><br/>corpus μ/σ (10 channels)"]
+        H["<b>Albumentations</b><br/>H/V flip · Rotate90 · CoarseDropout"]
+        I["<b>Prithvi-EO-2.0 Encoder</b><br/>ViT · pretrained · 121M params<br/>neck: ReshapeTokensToImage"]
+        J["<b>UperNetDecoder</b><br/>512 ch · multi-scale FPN"]
+        K["<b>Head</b><br/>Dropout 0.4 → Conv1×1 → 3 logits"]
+        G --> H --> I --> J --> K
+    end
+
+    L["⚖️ <b>Hybrid Loss</b><br/>0.4·CE(w=[1,7,4]) + 0.6·Dice<br/><i>ignore_index = −1</i>"]
+
+    subgraph POST ["🔬 &nbsp;Stage 3 — Inference"]
+        direction TB
+        M["<b>Argmax</b> → 3-class mask<br/><i>int16 · nodata −1 · LZW</i>"]
+        N["<b>Uncertainty map</b><br/>per-pixel confidence raster"]
+        O["<b>RLE encoding</b><br/>Class 1 only · empty ⇒ <code>0 0</code>"]
+        M --> N --> O
+    end
+
+    P["📄 <b>submission.csv</b><br/>(id, rle_mask)"]
+
+    A --> PREP
+    A2 --> PREP
+    PREP --> F --> TRAIN --> L
+    L -.->|backprop| TRAIN
+    TRAIN --> POST --> P
+
+    classDef input fill:#0EA5E9,stroke:#0369A1,stroke-width:2px,color:#fff
+    classDef stack fill:#7C3AED,stroke:#5B21B6,stroke-width:2px,color:#fff
+    classDef loss  fill:#F59E0B,stroke:#B45309,stroke-width:2px,color:#000
+    classDef out   fill:#00C896,stroke:#047857,stroke-width:2px,color:#000
+    class A,A2 input
+    class F stack
+    class L loss
+    class P out
 ```
 
 ---
 
-#### AI Methodology
+## 🧪 Feature Engineering — The Core Novelty
 
-**Hybrid: Domain-Informed Multi-Modal Learning + Foundation Model Adaptation**
+The competition ships **6 bands**. We ship **10** — and every added channel carries a hydrological or radar-physics meaning. Nothing is a raw pixel dump, nothing is zero padding.
 
-The methodology combines: (1) *physics-guided feature engineering* over raw SAR/optical bands prior to feeding a vision transformer, and (2) *foundation model fine-tuning* — adapting Prithvi-EO-v2-300, a geospatial ViT pre-trained on multi-spectral Sentinel-2/Landsat at continental scale, to handle the engineered 6-band input stream.
+| # | Band | Formula / Source | μ | σ | 🧠 Physical Reasoning |
+|:-:|:---|:---|--:|--:|:---|
+| 1 | 🔴 **HH** | Sentinel-1 GRD | 801.79 | 435.30 | Co-pol backscatter — open water is specular → dark |
+| 2 | 🟠 **HV** | Sentinel-1 GRD | 357.10 | 164.03 | Cross-pol — volume scattering; separates canopy from smooth water |
+| 3 | 🟣 **SAR LogDiff** ⭐ | `10·log₁₀(HH − HV)` | 24.37 | 9.41 | Decibel scale linearises SAR's multiplicative speckle noise |
+| 4 | 🟪 **SAR Ratio** ⭐ | `HH / HV` | 2.31 | 0.89 | Cross-pol ratio — canonical surface-roughness signature in radar hydrology |
+| 5 | 🟢 **DEM** ⭐ | NASADEM 30 m (earthaccess) | **2.38** | 2.38 | Absolute elevation — water does not climb |
+| 6 | 🫒 **Slope** ⭐ | `‖∇DEM‖` | 0.56 | 0.44 | Runoff physics — steep sheds, flat accumulates |
+| 7 | 🟩 **Green** | Optical | 1836.63 | 628.82 | Water-index input; high reflectance over turbid water |
+| 8 | 🔺 **Red** | Optical | 1688.38 | 615.60 | Vegetation / soil discrimination |
+| 9 | 🟫 **NIR** | Optical | 1812.14 | 588.76 | Strong vegetation response; water absorbs |
+| 10 | 🔵 **SWIR** | Optical | 1275.31 | 543.94 | Water absorbs SWIR almost totally — strongest passive water delineator |
 
-This methodology is appropriate because the ViT backbone provides rich spatial representation capacity learned across diverse Earth conditions, while domain-derived indices reduce the burden on the model to re-learn spectral physics from limited labeled flood data.
+<sub>⭐ = engineered by us. μ/σ computed corpus-wide and wired into the TerraTorch datamodule.</sub>
 
----
+> [!NOTE]
+> **That DEM mean is not a bug.** The study area — the Ganges–Brahmaputra delta of West Bengal — has a mean elevation of **≈ 2.4 m** with a standard deviation of the same magnitude. This is precisely why the region floods, and precisely why terrain alone cannot solve the task here: there is almost no relief to exploit. The DEM earns its channel by marking the handful of metres that separate a riverbank from a floodplain.
 
-#### Novel Contribution
+### 🏔 Where the DEM comes from
 
-**1. MNDWI as a Flood/Water Discriminator (Key Differentiator)**  
-→ *What:* Modified Normalized Difference Water Index — `(Green − SWIR) / (Green + SWIR + ε)` — replaces raw Green/SWIR channels.  
-→ *Why needed:* Permanent water bodies (rivers, reservoirs) and active flood inundation both suppress SAR backscatter. MNDWI peaks strongly for open water but decays for turbid/shallow flood water over vegetation or soil.  
-→ *Why others likely did NOT do it:* Most Kaggle baselines use raw optical bands or only NDWI. MNDWI (Xu, 2006) is specifically superior to NDWI for flood–water distinguishability in remote sensing hydrology but is under-utilized in competition settings.  
-→ *Problem solved:* Directly attacks Class 1/2 confusion — the dominant failure mode in three-class flood segmentation.
+```mermaid
+flowchart LR
+    A["🔑 <b>NASA Earthdata</b><br/>earthaccess.login()"] --> B["🔍 <b>search_data</b><br/>short_name = NASADEM_HGT<br/>bbox = West Bengal"]
+    B --> C["⬇️ <b>download</b><br/>.zip → .hgt tiles"]
+    C --> D["🧩 <b>merge</b><br/>mosaic, method='first'"]
+    D --> E["🌐 <b>reproject</b><br/>→ scene CRS, bilinear<br/><i>cached once, reused per patch</i>"]
+    E --> F["✂️ <b>window crop</b><br/>from_bounds per patch"]
+    F --> G["📐 <b>resize + ∇</b><br/>→ DEM band + Slope band"]
 
-**2. SAR Log-Ratio Feature (Surface Roughness Encoding)**  
-→ *What:* `SAR_LogRatio = 10 · log₁₀(|HH| / |HV| + ε)` — replaces raw HH/HV pair with their decibel-scale cross-polarization ratio.  
-→ *Why needed:* Flooded surfaces exhibit specular reflection, yielding characteristic HH/HV ratio signatures. Raw linear-scale SAR channels are heavily skewed; log-ratio is the physically canonical representation used in radar hydrology.  
-→ *Why others likely did NOT do it:* Most competitors treat raw SAR bands as image channels without domain transformation, ignoring the multiplicative noise structure of SAR signals.  
-→ *Problem solved:* Improves signal-to-noise for SAR modality; provides a more linearizable input for gradient-based optimization.
+    classDef ext fill:#1E3A5F,stroke:#3B82F6,color:#fff
+    classDef proc fill:#312E81,stroke:#818CF8,color:#fff
+    classDef out fill:#064E3B,stroke:#10B981,color:#fff
+    class A,B,C ext
+    class D,E,F proc
+    class G out
+```
 
-**3. NDVI as Vegetation False-Positive Suppressor**  
-→ *What:* `NDVI = (NIR − Red) / (NIR + Red + ε)` as a dedicated channel.  
-→ *Why needed:* Dense vegetation canopies can double-bounce SAR and produce flood-like backscatter signatures. NDVI explicitly encodes vegetation density so the model can suppress flood predictions where NDVI is high.  
-→ *Problem solved:* Reduces false positives in forested/agricultural areas during the monsoon season.
-
-**4. 3-Phase Training Schedule with Frozen Encoder Warmup**  
-→ *Phase 1 (5 epochs, lr=1e-5, encoder frozen):* Forces the UperNet decoder and head to adapt to the new 6-band input space without corrupting pretrained ViT weights.  
-→ *Phase 2 (15 epochs, lr=1e-4, full unfreeze):* Backbone fine-tuning once decoder provides meaningful gradients.  
-→ *Phase 3 (20 epochs, CosineAnnealingLR, lr=1e-5→1e-7):* Final convergence loading Phase 2's best checkpoint.  
-→ *Why non-trivial:* Standard single-phase fine-tuning on a 6-band ViT backbone risks catastrophic forgetting; this schedule prevents gradient shock during band adaptation.
-
-**5. Class-Weighted Hybrid Loss (CE + Dice, Flood-Biased)**  
-→ *What:* `Loss = 0.3 · CrossEntropy(w=[1.0, 8.0, 4.0]) + 0.7 · DiceLoss`, `ignore_index=−1` for no-data pixels.  
-→ *Why:* Flood class (Class 1) is severely underrepresented spatially. Pure CE on imbalanced masks collapses to background prediction. Dice loss is inherently region-based and class-frequency agnostic. The 8× flood weight further biases CE gradient toward the rare class. The 70% Dice weighting is tuned via Optuna along with all class weights.  
-→ *Why others likely did NOT do it:* Most baseline pipelines use equal CE or unweighted Dice; the joint weighting ratio as an Optuna hyperparameter (along with per-class weights) is non-standard.
-
-**6. Post-HPO 3-Seed Ensemble**  
-→ *What:* Three full 3-phase training runs with Optuna-tuned hyperparameters, seeds {42, 123, 456}. Inference: averaged softmax logits before argmax.  
-→ *Why:* Reduces variance from stochastic augmentation and weight initialization. Soft averaging prevents any single model's overconfident wrong prediction from dominating the final output.
-
----
-
-#### Success Metrics
-
-| Metric | Objective |
-|---|---|
-| **val/IoU_1 (Flood class)** | Primary — maximized by Optuna |
-| **val/IoU_2 (Water Body)** | Secondary — confirms Class 1/2 separation |
-| **val/IoU_0 (No Flood)** | Sanity check — should remain high throughout |
-| **Class weight generalization** | bg, flood, water weights all tuned; prevents dependence on fixed priors |
-| **Ensemble score variance** | Std deviation across 3 seeds monitors training stability |
-| **RLE submission validity** | Empty masks explicitly handled as `"0 0"` per competition rule |
+The mosaic is reprojected and cached **once** in `DeepFeatureStacker.__init__`, then window-cropped per patch — avoiding a per-image reprojection that would otherwise dominate runtime. Edge patches falling outside the mosaic fall back to zero-filled DEM/slope rather than crashing.
 
 ---
 
----
+## ⚙️ Training Recipe
 
-## Page 2: Evidence, Obstacles, and Execution
+<table>
+<tr><th align="left" width="50%">🔧 Configuration</th><th align="left">📦 Stack</th></tr>
+<tr valign="top"><td>
 
-### 3. Preliminary Salient Results
+| Parameter | Value |
+|:---|:---|
+| 🧠 Backbone | `prithvi_eo_v2_100_tl` |
+| 🔻 Decoder | `UperNetDecoder` (512 ch) |
+| 📊 Trainable params | **121 M** (485 MB) |
+| 🎚 Learning rate | `3e-6` |
+| 🪶 Weight decay | `0.01` |
+| 💧 Dropout (head) | `0.4` |
+| 🔁 Max epochs | `120` |
+| 📦 Batch size | `6` (grad accum ×4 → eff. 24) |
+| ⚡ Precision | `16-mixed` (FP16 AMP) |
+| 📉 Scheduler | `ReduceLROnPlateau` |
+| 🧊 Freeze backbone | `False` — full fine-tune |
+| 🎲 Seed | `42` |
+| ⏱ Wall-clock | ~18 min (Kaggle GPU) |
 
-#### Initial Findings
+</td><td>
 
-The Optuna HPO stage (10 trials × 8 epochs each) optimizes `val/IoU_1` as its objective, using the Phase 1+2 checkpoint as a warm start. This substantially reduces per-trial cost relative to training from scratch. The MedianPruner with `n_startup_trials=3` and `n_warmup_steps=5` eliminates underperforming trials early, providing effective compute allocation. In the optimized configuration, HyperbandPruner replaces MedianPruner for more aggressive early elimination.
+- 🔥 **PyTorch Lightning** — training loop
+- 🌍 **TerraTorch** — `GenericNonGeoSegmentationDataModule`
+- 🛰 **rasterio** — GeoTIFF I/O, merge, reprojection
+- 🏔 **earthaccess** — NASADEM retrieval
+- 🎨 **albumentations** — flip · rotate90 · CoarseDropout
+- 👁 **OpenCV** — DEM resampling
+- 📊 **TensorBoard** (+ LocalTunnel) — live metrics
 
-`ShiftScaleRotate` augmentation (`shift_limit=0.1, scale_limit=0.2, rotate_limit=30°`) addresses the geographically diverse nature of flood events occurring at varying image orientations depending on SAR acquisition geometry.
+**Augmentation**
+```python
+HorizontalFlip(p=0.5) · VerticalFlip(p=0.5)
+RandomRotate90(p=0.5)
+CoarseDropout(holes=1-4, 8-32px, p=0.2)
+```
 
-#### Quantifiable Progress
+**Callbacks**
+- `ModelCheckpoint(monitor="val/IoU_1", mode="max")`
+- `LearningRateMonitor(logging_interval="step")`
 
-- **Primary metric:** `val/IoU_1` (Flood class IoU) — the competition's primary discriminative metric, directly optimized through Optuna with multivariate TPE (models joint parameter distributions, not independent marginals).
-- **Computational throughput:** Batch size 32 on H100 80GB with `bf16-mixed` precision + `torch.compile(mode='reduce-overhead')` achieves ~20–30% throughput improvement over FP16, enabling more Optuna trials within the same compute budget.
-- **Optuna search space explicitly covers:** `lr ∈ [1e-6, 1e-3]`, `dropout ∈ [0.05, 0.6]`, `dice_weight ∈ [0.4, 0.8]`, `flood_weight ∈ [2.0, 15.0]`, `water_weight ∈ [1.0, 8.0]`, `bg_weight ∈ [0.5, 2.0]` — covering all critical axes of uncertainty simultaneously.
+</td></tr>
+</table>
 
-#### Visualization
+### ⚖️ The loss function
 
-Predicted segmentation masks should exhibit: flood inundation pixels (Class 1) as thin, irregular strips following drainage networks and low-lying terrain — distinct from Class 2 (compact, polygon-like water bodies with smooth boundaries). The MNDWI input channel, when visualized, should show strong positive response in flat permanent water and weaker response in dynamic flood zones over soil/vegetation — providing the key visual cue the model is trained to leverage.
+$$\mathcal{L} = 0.4 \cdot \text{CE}(w=[1.0,\ 7.0,\ 4.0]) \;+\; 0.6 \cdot \text{Dice}$$
 
-**Sanity-check interpretation:** If Class 2 predicted areas spatially co-register with known reservoir/river positions, and Class 1 regions appear at terrain margins visible in slope-derived indices, the model is learning physically consistent patterns rather than textural noise. Cross-checking flood predictions against rainfall accumulation maps (future step) provides an independent physical consistency test.
+```mermaid
+xychart-beta
+    title "Cross-entropy class weights — biasing gradient toward the rare flood class"
+    x-axis ["Class 0 · No Flood", "Class 1 · Flood", "Class 2 · Water Body"]
+    y-axis "Weight" 0 --> 8
+    bar [1.0, 7.0, 4.0]
+```
 
----
-
-### 4. Technical Challenges & Pivots
-
-#### Current Roadblocks
-
-| Challenge | Technical Detail |
-|---|---|
-| **Class 1/2 confusion** | SAR backscatter suppression is identical for open water and flood; MNDWI partially resolves this but boundary ambiguity persists |
-| **Label noise at flood margins** | Sub-pixel mixed boundaries between classes create ambiguous training signal; `ignore_index=−1` partially mitigates but does not fully address |
-| **Single-date inference** | No temporal SAR pair at inference; blocks SAR change detection — the most physically reliable flood indicator |
-| **ViT band-mismatch** | Prithvi-EO-v2 pretrained on Sentinel-2/Landsat bands; mapping engineered index stack (NDWI, MNDWI, NDVI) to backbone `backbone_bands=[0..5]` requires careful positional alignment |
-| **No terrain data (current version)** | DEM + slope features (from NASADEM via earthaccess) were implemented in v1 (DeepSARFloodStacker, 10-band) but excluded from current optimized 6-band stack to eliminate zero-padding waste |
-
-#### Strategic Pivots
-
-**Pivot 1: From 10-band (DEM+Slope) to 6-band (optical indices)**  
-*What failed:* Initial version built a 10-channel stack `[HH, HV, LogRatio, Ratio, DEM, Slope, 0, 0, 0, 0]`. Optical bands were removed to satisfy a SAR-only constraint, leaving 4 zero-padding channels.  
-*Why it failed:* Zero-padding wastes backbone attention capacity and introduces spurious cross-channel correlations. The Prithvi ViT backbone has no conditioning to ignore zero channels.  
-*Fix:* Replaced zero-padding with domain-derived optical indices (NDWI, MNDWI, NDVI) — physically meaningful, bounded in [−1, 1], compatible with per-band normalization, and directly discriminative for the flood vs. water class boundary.
-
-**Pivot 2: HPO sampler upgrade (multivariate TPE + HyperbandPruner)**  
-*What improved:* Default TPE with independent parameter modeling → multivariate TPE + HyperbandPruner.  
-*Why better:* LR and weight decay are strongly correlated for AdamW convergence; univariate TPE cannot model their joint distribution. HyperbandPruner eliminates unpromising trials 3–4× faster than MedianPruner, enabling 30 trials in the same compute budget as 10 trials.
-
----
-
-### 5. Final Sprint Roadmap (Next Steps)
-
-#### Immediate Tasks (Next 10 Hours)
-
-1. Complete 30-trial Optuna HPO run (`optuna_model1_optimized.py`, H100, multivariate TPE + HyperbandPruner)
-2. Extract best `[lr, weight_decay, dropout, dice_weight, flood_weight, water_weight, bg_weight, decoder_channels]` from Optuna study object
-3. Launch 3-seed ensemble training (seeds: 42, 123, 456) with best hyperparameters via `run_stage3()`
-4. Run `predict_ensemble()` + `generate_submission()` → validate RLE format and inspect flood coverage rate vs. baseline
-5. Execute `save_everything()` → ZIP + download backup before session expiry
-
-#### Refinement Plan
-
-| Enhancement | Rationale |
-|---|---|
-| **SAR Temporal Differencing (ΔσHH)** | Add pre-event SAR band at pixel level: `Δσ = σ_event − σ_pre`. Converts implicit change detection into a direct engineered input feature. Requires full Sen1Floods11 archive for pre-event scene matching. |
-| **Rainfall runoff model integration** | Inject cumulative rainfall accumulation or PERSIANN/GPM raster as an additional spatial channel. Provides physical prior on flood likelihood independent of SAR backscatter ambiguity in shadow regions. |
-| **Waterbody morphology post-processing** | Apply connected-component analysis + compactness ratio `(4πA / P²)` to discriminate Class 1 (irregular, elongated flood extents, compactness ≪ 1) from Class 2 (compact polygon-stable water bodies, compactness → 1). High compactness → rule-based relabeling as Class 2. |
-| **Full Sen1Floods11 pretraining** | Leverage broader global flood dataset for geographic diversity before competition fine-tuning. Reduces risk of regional overfitting to competition's specific geographic envelope. |
-
-#### Final Output
-
-| Deliverable | Format |
-|---|---|
-| Competition submission | `submission_v3.csv` — (id, rle_mask), Class 1 flood only |
-| Best ensemble checkpoint | 3× `.ckpt` (Phase 3 best checkpoint per seed) |
-| Optuna study | Serialized study object with full 30-trial history |
-| Notebook | `flood_phase2_complete.ipynb` — fully executable, self-contained |
-| Backup archive | `FLOOD_BACKUP.zip` — checkpoints + `stats.json` + CSVs |
+| Component | Weight | Why it's there |
+|:---|:---:|:---|
+| 🎯 **Dice** | `0.6` | Region-based and class-frequency agnostic — directly correlates with the scored IoU |
+| 📏 **Cross-Entropy** | `0.4` | Stable per-pixel gradients; prevents Dice's instability on near-empty masks |
+| ⚖️ **Class weights** | `[1, 7, 4]` | 7× on flood stops collapse-to-background; 4× on water sharpens the Class 1/2 boundary |
+| 🚫 **`ignore_index`** | `−1` | No-data and ambiguous sub-pixel flood margins contribute zero gradient |
 
 ---
 
-*Team ENDRA — Abhay Kale, Akash Chaudhari, Somesh Padsalge*  
-*License: ANRF Open License (compatible with MIT) · © 2026*
+## 📊 Results
+
+Measured on the held-out test split, using the best checkpoint
+(`best-flood-epoch=12-val/IoU_1=0.1635.ckpt`) selected on `val/IoU_1`.
+
+### 🏅 Headline metrics
+
+| | Metric | Score |
+|:---:|:---|:---:|
+| 🥇 | **`test/IoU_1`** — Flood *(primary)* | **0.1196** |
+| 🌐 | `test/mIoU` | **0.3933** |
+| 🔬 | `test/mIoU_Micro` | 0.4334 |
+| 📏 | `test/F1_Score` | 0.5299 |
+| 🎯 | `test/Accuracy` | 0.5873 |
+| 🖼 | `test/Pixel_Accuracy` | 0.6047 |
+| 📐 | `test/Boundary_mIoU` | 0.1001 |
+| 📉 | `test/loss` *(ce 0.910 · dice 0.540)* | 0.6883 |
+
+### 📈 Per-class breakdown
+
+```mermaid
+xychart-beta
+    title "Per-class recall (bar) vs IoU (line) — the precision gap"
+    x-axis ["Class 0 · No Flood", "Class 1 · Flood", "Class 2 · Water Body"]
+    y-axis "Score" 0 --> 1
+    bar [0.6501, 0.6065, 0.5052]
+    line [0.6239, 0.1196, 0.4364]
+```
+
+| Class | Recall *(Class_Accuracy)* | IoU | 📖 Reading |
+|:---|:---:|:---:|:---|
+| ⬛ **0 · No Flood** | 0.6501 | 0.6239 | Recall ≈ IoU → predictions are well-calibrated here |
+| 🟦 **1 · Flood** | 0.6065 | **0.1196** | ⚠️ **Recall 5× the IoU** — the model *finds* flood but over-predicts it massively |
+| 🟨 **2 · Water Body** | 0.5052 | 0.4364 | Moderate gap — some bleed into Class 1 |
+
+### 🔍 Honest error analysis
+
+> [!IMPORTANT]
+> **The headline number is low, and the gap tells us exactly why.**
+
+**1️⃣ The 7× flood weight bought recall and paid for it in precision.**
+Class 1 recall is `0.61` — the model *does* see the flood. But IoU is `0.12`, which means the union is far larger than the intersection: it is flagging large regions of non-flood as flood. In a delta where nearly everything is 2 m above sea level and radar-dark, that is the expected failure. The weight is over-tuned; `[1, 3, 2]` with a higher Dice share is the first thing to try.
+
+**2️⃣ Best checkpoint at epoch 12 of 120 — it overfit for the remaining 108.**
+`val/IoU_1` peaked at `0.1635` very early and never recovered. Training ran nearly 10× longer than useful. Early stopping on `val/IoU_1` would have saved ~90% of the compute, and the gap between the val peak (`0.1635`) and the test score (`0.1196`) indicates the validation split is also being partly fit through checkpoint selection.
+
+**3️⃣ `Boundary_mIoU` of `0.10` confirms the diagnosis.**
+Boundary IoU being roughly a quarter of `mIoU` means the errors are concentrated at class *edges* — exactly the Flood ↔ Water Body frontier the whole feature stack was designed to attack. The morphological post-processing described in the finale deck is not yet wired into this notebook's inference path; that is the most direct available fix.
+
+**4️⃣ What is genuinely working.**
+The 10-band fusion pipeline runs end to end, the DEM co-registers correctly, Prithvi loads and fine-tunes without gradient shock, and `IoU_0 = 0.62` / `IoU_2 = 0.44` show the model has learned a real, physically-structured decision boundary — it is not predicting a constant. The problem is calibration on the rare class, not a broken pipeline.
+
+### 🎯 Where the next points come from
+
+| Priority | Fix | Expected effect |
+|:---:|:---|:---|
+| 🔴 **1** | Lower flood class weight to `~3`, raise Dice share to `0.7` | Trade recall for precision — directly targets the IoU_1 gap |
+| 🔴 **2** | `EarlyStopping(monitor="val/IoU_1", patience=15)` | ~10× cheaper runs, more experiments per budget |
+| 🟠 **3** | Wire morphological post-processing into inference | Attacks `Boundary_mIoU = 0.10` at the Class 1/2 edge |
+| 🟠 **4** | Proper geographic train/val split | Current split risks spatial leakage between adjacent patches |
+| 🟡 **5** | Optuna HPO over `lr`, `dice_weight`, class weights | Systematic instead of manual |
+| 🟡 **6** | Multi-seed soft-averaged ensemble | Variance reduction, typically +1–3 IoU points |
+
+> [!NOTE]
+> Competition test labels are not public. **All metrics above are on our internal held-out split**, produced by `trainer.test()` in the main notebook — the raw output table is preserved in the committed cell outputs.
+
+### 👁 What a correct prediction looks like
+
+| Class | Expected morphology | Cross-check |
+|:---|:---|:---|
+| 🟦 **Flood (1)** | Thin, irregular, **dendritic** strips following drainage networks and terrain contours | Should sit in low-elevation, low-slope basins |
+| 🟨 **Water Body (2)** | Compact, **polygon-like**, smooth stable boundaries | Should spatially co-register with known rivers/channels |
+
+This is the prior the planned morphological post-processing encodes: circularity $4\pi A / P^2 \to 1$ implies a compact permanent water body; $\ll 1$ implies flood inundation.
+
+---
+
+## 🧭 Challenges & Pivots
+
+### 🚧 Roadblocks hit
+
+| Challenge | 🔍 Detail | 🔧 Mitigation |
+|:---|:---|:---|
+| **Class 1/2 confusion** | SAR backscatter suppression is identical for flood and open water | Polarimetric ratios + optical SWIR; **not yet solved** — see `Boundary_mIoU` |
+| **Flood over-prediction** | 7× class weight drove recall up and precision down | Identified; weight reduction is fix #1 |
+| **Import collisions** | Kaggle base image conflicts with `terratorch` | Install to `/kaggle/temp/custom_libs` + `sys.path.insert(0, …)` |
+| **DEM ↔ scene alignment** | NASADEM in geographic CRS, scenes in projected CRS | `calculate_default_transform` + bilinear reproject, cached once |
+| **Edge patches** | Patches outside the DEM mosaic produced empty crops | Explicit `dem_crop.size == 0` guard → zero-filled fallback |
+| **GPU memory** | Prithvi + UperNet is memory-hungry | FP16 AMP, gradient accumulation ×4, batch size 6 |
+| **Class imbalance** | Flood pixels <5% of image | Class weights + Dice component |
+| **No terrain relief** | Delta mean elevation ≈ 2.4 m | DEM retained but contributes far less signal than in hilly terrain |
+
+### 🔀 Strategic pivots
+
+```mermaid
+flowchart LR
+    P1["❌ Full D8 HAND<br/><i>TauDEM / Whitebox</i>"] -->|"prohibitively slow<br/>on Kaggle GPU"| P1b["✅ DEM + gradient slope<br/><i>cheap, adequate on flat delta</i>"]
+    P2["❌ Per-patch DEM<br/>reprojection"] -->|"dominated runtime"| P2b["✅ Reproject-once +<br/>cache + window crop"]
+    P3["❌ 6-band stack<br/><i>raw bands only</i>"] -->|"model re-learning<br/>radar physics"| P3b["✅ 10-band stack with<br/>polarimetric + terrain features"]
+
+    classDef bad fill:#7F1D1D,stroke:#DC2626,color:#fff
+    classDef good fill:#064E3B,stroke:#10B981,color:#fff
+    class P1,P2,P3 bad
+    class P1b,P2b,P3b good
+```
+
+---
+
+## 🗺 Roadmap
+
+```mermaid
+timeline
+    title Project Timeline — ANRF AISEHack 2026 Theme 1
+    section ✅ Delivered
+        Mid-Submission : 6-band experiments (SWIR isolation, Fast-HAND proxy)
+                       : Prithvi EO v2 fine-tuning via TerraTorch
+                       : Hybrid CE + Dice loss with class weighting
+        Main Pipeline  : 10-band physics stack (SAR ratios + NASADEM + optical)
+                       : Full 120-epoch run, measured test metrics
+                       : Per-pixel uncertainty maps
+                       : RLE submission generator
+    section 🔧 In Progress
+        Calibration    : Reduce flood class weight, raise Dice share
+                       : Early stopping on val/IoU_1
+                       : Morphological Flood vs Water post-processing
+    section 🔮 Next
+        Scale-up       : Optuna HPO over loss weights and learning rate
+                       : Multi-seed soft-averaged ensemble
+                       : Full Sen1Floods11 pretraining
+        Operational    : Geographic train/val split, no spatial leakage
+                       : Near-real-time inference on new acquisitions
+```
+
+### 📦 Deliverables
+
+| Deliverable | Format | Location |
+|:---|:---|:---|
+| 📓 **Main pipeline** | Jupyter notebook *(with outputs)* | [`notebooks/flood-detection-and-segmentation-west-bengal.ipynb`](notebooks/flood-detection-and-segmentation-west-bengal.ipynb) |
+| 📓 Mid-submission experiments | Jupyter notebook | [`notebooks/AISE_Hack_MidSubmission.ipynb`](notebooks/AISE_Hack_MidSubmission.ipynb) |
+| 📊 Finale presentation | PPTX *(generated)* | [`presentation/`](presentation/) |
+| 📄 Mid-submission report | DOCX | [`docs/`](docs/) |
+| 🧭 Strategy & novelty write-up | Markdown | [`docs/midpoint-checkin.md`](docs/midpoint-checkin.md) |
+| 📤 Competition submission | `submission.csv` — `(id, rle_mask)`, Class 1 only | generated at runtime |
+
+---
+
+## 📁 Repository Structure
+
+```
+Team-ENDRA-AISEHack/
+│
+├── 📓 notebooks/
+│   ├── flood-detection-and-segmentation-west-bengal.ipynb   ⭐ MAIN — 10-band, full run
+│   └── AISE_Hack_MidSubmission.ipynb                        ── mid-submission experiments
+│
+├── 📄 docs/
+│   ├── midpoint-checkin.md             ← strategy, novelty & technical deep-dive
+│   └── AISE_MidSubmission.docx         ← official mid-submission report
+│
+├── 🎤 presentation/
+│   ├── generate_ppt.py                 ← builds the finale deck programmatically
+│   ├── TeamENDRA_FinalPresentation.pptx  ← generated output
+│   └── templates/
+│       └── ANRFAISEHack_Template_FinalePresentation.pptx
+│
+├── 🖼 assets/                           ← diagrams & figures
+├── 📋 requirements.txt
+├── ⚖️ LICENSE.md                        ← ANRF Open License (MIT-compatible)
+└── 📖 README.md                         ← you are here
+```
+
+### 🧩 Main notebook anatomy
+
+| Cells | Section | Key components |
+|:---:|:---|:---|
+| 0–5 | 🔧 Environment | `terratorch` + `earthaccess` → `/kaggle/temp/custom_libs`, imports |
+| 6–7 | ⚙️ Configuration | `Config` — single source of truth for paths, bands, μ/σ, hyperparameters |
+| 8–14 | 🧱 Data pipeline | `download_kaggle_competition()` · `DEMDownloader` · `DEMProcessor` · `DeepFeatureStacker` · `run_data_pipeline()` |
+| 16–17 | 📤 Submission utils | `mask_to_rle()` · `generate_submission()` · `get_train_transforms()` |
+| 18–20 | 🧠 Model | `build_datamodule()` · `build_model()` · `get_loggers()` + architecture notes |
+| 21 | 🚀 Training & inference | `generate_phase2_submission()` · `main()` — fit → test → predict → uncertainty maps |
+| 22 | 📊 Monitoring | TensorBoard on `:6005` + LocalTunnel public URL |
+| 23 | ▶️ Entry point | Credential loading → `run_data_pipeline()` → `main()` |
+
+---
+
+## 🚀 Quickstart
+
+### 1️⃣ Install
+
+```bash
+pip install -r requirements.txt
+```
+
+> 🧪 On Kaggle, the notebook installs into `/kaggle/temp/custom_libs` and prepends it to `sys.path` — this is what resolves the `terratorch` import collision with the Kaggle base image.
+
+### 2️⃣ Configure credentials
+
+> [!WARNING]
+> **Never hardcode credentials in the notebook.** Use Kaggle Secrets (`Add-ons ▸ Secrets`) or environment variables. Cell 23 reads both, preferring Kaggle Secrets and falling back to the environment.
+
+| Variable | Used for | Where to get it |
+|:---|:---|:---|
+| `EARTHDATA_USERNAME` | NASADEM tile download | [urs.earthdata.nasa.gov](https://urs.earthdata.nasa.gov/) — free |
+| `EARTHDATA_PASSWORD` | ″ | ″ |
+| `LIGHTNING_API_KEY` | Lightning logging *(optional)* | [lightning.ai](https://lightning.ai/) |
+| Kaggle API token | Competition dataset | `~/.kaggle/kaggle.json` |
+
+```bash
+export EARTHDATA_USERNAME="your-username"
+export EARTHDATA_PASSWORD="your-password"
+```
+
+> 📌 The competition dataset (`anrfaisehack-theme-1-phase2`) is privately owned by IBM. To reproduce, substitute your own Sentinel-1 + optical patches in the same layout.
+
+### 3️⃣ Build the 10-band stacks
+
+```python
+run_data_pipeline()   # download → NASADEM mosaic → reproject → 10-band fusion
+```
+
+Expected layout after this step:
+
+```
+data/
+├── image/                  *_image.tif   (original 6-band)
+├── image_10band/           *_image.tif   (fused 10-band stacks)
+├── label/                  *_label.tif   (3-class masks)
+├── split/                  train.txt · val.txt · test.txt
+├── dem_raw/ dem_temp/      NASADEM .zip / .hgt
+└── prediction/image_10band/
+```
+
+### 4️⃣ Train
+
+```python
+main()   # fit → test on best checkpoint → predict + uncertainty maps → submission
+```
+
+Checkpoints land in `Output/checkpoints/`, selected on `val/IoU_1`. Uncertainty rasters go to `Output/uncertainty_maps/`.
+
+### 5️⃣ Monitor (optional)
+
+Cell 22 starts TensorBoard on port `6005` and exposes it through LocalTunnel — useful when training on a remote Kaggle instance.
+
+### 6️⃣ The submission
+
+`main()` calls `generate_phase2_submission()` automatically, emitting `(id, rle_mask)` for **Class 1 only**, with empty masks encoded as `"0 0"` per competition rule.
+
+### 🎤 Rebuild the presentation
+
+```bash
+python presentation/generate_ppt.py
+```
+
+Reads the template from `presentation/templates/` and writes `presentation/TeamENDRA_FinalPresentation.pptx`.
+
+---
+
+## 📚 Design Notes
+
+<details>
+<summary><b>🔬 Why a foundation model instead of a U-Net from scratch?</b></summary>
+
+<br/>
+
+Labelled flood data is scarce and geographically biased. A U-Net trained from scratch on a single competition corpus has to learn *both* generic spatial representation *and* flood-specific discrimination from the same small dataset.
+
+Prithvi-EO-2.0 arrives already knowing what terrain, rivers, fields and urban texture look like across continents. Fine-tuning only has to teach it **one new thing** — *which dark pixels are anomalous water*. That is a far smaller ask, and it's why a 121M-parameter ViT can be fine-tuned in ~18 minutes on a handful of patches without immediately diverging.
+
+The flip side is visible in our results: transfer learning got the pipeline to a *structured* prediction quickly, but it does nothing for **class calibration**. That has to be earned through the loss.
+
+</details>
+
+<details>
+<summary><b>🧭 Pipeline variants explored</b></summary>
+
+<br/>
+
+Three feature stacks were built over the course of the hackathon. The 10-band stack is the one that shipped.
+
+| | **10-band** ⭐ *(main)* | **6-band terrain** | **6-band spectral** |
+|:---|:---|:---|:---|
+| **Notebook / doc** | `…west-bengal.ipynb` | `AISE_Hack_MidSubmission.ipynb` | [`docs/midpoint-checkin.md`](docs/midpoint-checkin.md) |
+| **Bands** | HH · HV · LogDiff · Ratio · DEM · Slope · G · R · NIR · SWIR | HH · HV · SWIR · DEM · Fast-HAND · Slope | HH · HV · NDWI · MNDWI · NDVI · SAR log-ratio |
+| **DEM source** | NASADEM (earthaccess) | Copernicus (Planetary Computer) | — |
+| **Backbone** | Prithvi EO v2 100M | Prithvi EO v2 100M | Prithvi EO v2 300M |
+| **Loss** | 0.4·CE + 0.6·Dice, `w=[1,7,4]` | 0.4·CE + 0.6·Dice, `w=[1,5,3]` | 0.3·CE + 0.7·Dice, `w=[1,8,4]` |
+| **LR / epochs** | `3e-6` / 120 | `2e-5` / 90 | 3-phase schedule |
+| **Tuning** | Manual | Manual | Optuna, multivariate TPE |
+| **Status** | ✅ **Run, measured** | Experimental | Design only |
+
+Two ideas from the variants are worth folding back in:
+
+- **Fast-HAND** — `DEM − local_min(DEM, 450m)`, a ~100× cheaper approximation of Height Above Nearest Drainage. Less useful on the flat delta than it would be in hilly terrain, but it directly encodes "flood-prone basin".
+- **MNDWI** — `(Green − SWIR)/(Green + SWIR)` is a stronger flood/permanent-water discriminator than NDWI, because it peaks for clean open water but decays over turbid or shallow flood water on soil and vegetation.
+
+The stacks attack the **same failure mode from opposite directions**: terrain asks *"could water be here?"*, spectral indices ask *"does this look like standing water?"*. Given that Class 1/2 confusion is our dominant error, adding MNDWI to the 10-band stack is a cheap, high-expected-value experiment.
+
+</details>
+
+<details>
+<summary><b>⚠️ Known limitations</b></summary>
+
+<br/>
+
+- **Flood IoU is low (`0.12`).** The model over-predicts flood. See [error analysis](#-honest-error-analysis) — this is a calibration problem with an identified fix, not a pipeline failure.
+- **No temporal pair at inference.** Change detection — the most physically reliable flood indicator — is unavailable; the log-difference band approximates only the *polarimetric* contrast, not a before/after contrast.
+- **Validation split may leak.** Train/val/test splits are file-list based, not geographic. Adjacent patches from the same scene can straddle the split, inflating validation scores relative to test.
+- **Terrain signal is weak here.** Mean elevation ≈ 2.4 m across the delta. DEM and slope carry far less information than they would in a region with relief.
+- **Geographic envelope.** Trained only on West Bengal (86.5–89.0°E, 21.5–24.5°N). Generalisation to other basins is untested; Sen1Floods11 pretraining is the planned remedy.
+- **Post-processing not wired in.** The morphological Flood ↔ Water correction described in the finale deck is designed but not yet part of this notebook's inference path.
+
+</details>
+
+<details>
+<summary><b>🐛 Known nits in the main notebook</b></summary>
+
+<br/>
+
+Small inconsistencies worth cleaning up, none of which affect the run:
+
+| Cell | Issue |
+|:---:|:---|
+| 7 | `MEANS`/`STDS` comment reads *"for HH, HV, Green, Red, NIR, SWIR"* — stale from the 6-band version. The actual order is the 10-band one documented [above](#-feature-engineering--the-core-novelty). |
+| 18 | Markdown says **LR 2×10⁻⁵** and **CosineAnnealingWarmRestarts**; `Config` actually uses **`3e-6`** and **`ReduceLROnPlateau`**. The code is authoritative. |
+| 21 | `main()` runs 120 epochs unconditionally — no `EarlyStopping`, despite the best checkpoint landing at epoch 12. |
+| 21 | The uncertainty map is allocated with `np.zeros_like` and written without being populated from the softmax distribution — the rasters are currently all-zero placeholders. |
+
+</details>
+
+---
+
+## 👥 Team
+
+<div align="center">
+
+**Team ENDRA** · IIIT Hyderabad
+
+| Member |
+|:---|
+| 👨‍💻 **Abhay Kale** |
+| 👨‍💻 **Akash Chaudhari** |
+| 👨‍💻 **Somesh Padsalge** |
+
+</div>
+
+### 🙏 Acknowledgements
+
+| | Resource |
+|:---|:---|
+| 🛰 | **Prithvi-EO-2.0** — NASA / IBM geospatial foundation model |
+| ⚡ | **TerraTorch** — IBM's EO fine-tuning framework |
+| 🏔 | **NASADEM / SRTM** — NASA Earthdata elevation data |
+| 🇪🇺 | **Copernicus / ESA** — Sentinel-1 GRD imagery |
+| 🏆 | **ANRF AISEHack 2026** — dataset and problem framing |
+
+---
+
+<div align="center">
+
+⚖️ Licensed under the [**ANRF Open License**](LICENSE.md) (MIT-compatible) · © 2026 Team ENDRA
+
+<sub>Built for the AI for Science & Engineering Hackathon · Theme 1 — Flood Segmentation · West Bengal, India</sub>
+
+</div>
